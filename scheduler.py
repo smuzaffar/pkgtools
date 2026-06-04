@@ -1,5 +1,5 @@
 import sys
-from queue import Queue, PriorityQueue
+from queue import Queue, PriorityQueue, Empty
 from io import StringIO
 from threading import Thread
 from time import sleep
@@ -7,18 +7,20 @@ import threading
 import traceback
 from rmanager import ResourceManager
 
+from enum import Enum
+
+class State(Enum):
+    UNKNOWN = 0
+    PENDING = 1
+    SCHEDULED = 2   # optional but very useful
+    RUNNING = 3
+    DONE = 4
+    BROKEN = 5
+
 # Helper class to avoid conflict between result
 # codes and quit state transition.
 class _SchedulerQuitCommand(object):
   pass
-
-def transition(what, fromList, toList, key="unknow"):
-  try:
-    fromList.remove(what)
-  except ValueError as e:
-    print("DEBUG:%s: Transition failed for %s: Not in source list." % (key, what))
-  toList.append(what)
-  return True
 
 class Scheduler(object):
   # A simple job scheduler.
@@ -35,152 +37,233 @@ class Scheduler(object):
   # Post an appropriate build command for all the new jobs which got added.
   # If there are jobs still to be done, post a reschedule job on the command queue
   # if there are no jobs left, post the "kill worker" task.
-  # There is one, special, "final-job" which depends on all the scheduled jobs
-  # either parallel or serial. This job is guaranteed to be executed last and
-  # avoids having deadlocks due to all the queues having been disposed.
   def __init__(self, parallelThreads, logDelegate=None, buildStats=None, parallelDownloads=2):
+    self.cv = threading.Condition()
+    self.activeTasks = 0
+    self.shutdownRequested = False
     self.workersQueue = PriorityQueue()
     self.resultsQueue = Queue()
     self.notifyQueue = Queue()
-    self.rescheduleParallel = False
+    self.serialEnqueued = set()
     self.jobs = {}
-    self.pendingJobs = []
-    self.runningJobs = []
-    self.runningJobsCache = []
-    self.doneJobs = []
-    self.brokenJobs = []
+    self.reverseDeps = {}
+    self.stateCounter = {}
+    for state in State:
+      self.stateCounter[state] = 0
+    self.doneJobs = set()
+    self.doneOrdered = []
+    self.brokenJobs = set()
+    self.brokenOrdered = []
     self.parallelThreads = parallelThreads+parallelDownloads
     self.logDelegate = logDelegate
     self.resourceManager = None
-    self.runningJobsCount = {"build": 0, "fetch": 0, "download": 0, "max_build": parallelThreads, "max_download": parallelDownloads}
+    self.runningJobsCount = {"build": 0, "fetch": 0, "download": 0, "force": 0,"max_build": parallelThreads, "max_download": parallelDownloads}
     self.errors = {}
+    self.workers = []
+    self.masterThread = None
+    self.final_job = "final-job"
     if not logDelegate:
       self.logDelegate = self.__doLog 
     if buildStats:
       self.resourceManager = ResourceManager(buildStats, self)
-    # Add a final job, which will depend on any spawned task so that we do not
-    # terminate until we are completely done.
-    self.finalJobDeps = []
-    self.finalJobSpec = [self.doSerial, "final-job", self.finalJobDeps] + [self.__doLog, "Nothing else to be done, exiting."]
-    self.resultsQueue.put((threading.currentThread(), self.finalJobSpec))
-    self.jobs["final-job"] = {"scheduler": "serial", "deps": self.finalJobSpec, "spec": self.finalJobSpec}
-    self.pendingJobs.append("final-job")
 
-  def run(self):
-    for i in range(self.parallelThreads):
-      t = Thread(target=self.__createWorker())
-      t.daemon = True
-      t.start()
-
-    self.__doRescheduleParallel()
-    # Wait until all the workers are done.
-    while self.parallelThreads:
-      try:
-        self.__doNotifications()
-        who, item = self.resultsQueue.get()
-        item[0](*item[1:])
-        sleep(0.1)
-      except KeyboardInterrupt:
-        print ("Ctrl-c received, waiting for workers to finish")
-        while self.workersQueue.full():
-          self.workersQueue.get(False)
-        self.shout(self.quit)
-
-    # Prune the queue.
-    self.__doNotifications ()
-    while self.resultsQueue.full():
-      item = self.resultsQueue.get() 
-      item[0](*item[1:])
-    self.__doNotifications ()
+  def set_state(self, taskId, new_state):
+    assert(self.masterThread == threading.current_thread())
+    old = self.jobs[taskId]["state"]
+    assert(old != new_state)
+    if old in (State.DONE, State.BROKEN):
+        return
+    self.jobs[taskId]["state"] = new_state
+    self.stateCounter[old] -= 1
+    self.stateCounter[new_state] += 1
+    if new_state == State.BROKEN:
+      self.brokenOrdered.append(taskId)
+      self.brokenJobs.add(taskId)
+    elif new_state == State.DONE:
+      self.doneOrdered.append(taskId)
+      self.doneJobs.add(taskId)
     return
 
-  # Create a worker.
-  def __createWorker(self):
-    def worker():
-      while True:
-        pri, taskId, item = self.workersQueue.get()
-        try:
-          result = item[0](*item[1:])
-        except Exception as e:
-          s = StringIO()
-          traceback.print_exc(file=s)
-          result = s.getvalue()
-          
-        if type(result) == _SchedulerQuitCommand:
-          self.notifyTaskMaster(self.__releaseWorker)
-          return
-        self.log(str(item) + " done")
-        self.notifyMaster(self.__updateJobStatus, taskId, result)
-        if self.resourceManager and taskId.startswith('build-'):
-          self.notifyMaster(self.resourceManager.releaseResourcesForExternal, taskId)
-        self.notifyMaster(self.__rescheduleParallel)
-    return worker
+  def run(self):
+    self.masterThread = threading.current_thread()
+    for i in range(self.parallelThreads):
+      t = Thread(target=self.__workerLoop)
+      self.workers.append(t)
+      t.start()
+    while True:
+      self.__doNotifications()
+      try:
+        who, item = self.resultsQueue.get(timeout=0.1)
+        item[0](*item[1:])
+      except Empty:
+        pass
+      except KeyboardInterrupt:
+        print("Ctrl-C received, shutting down")
+        self.__requestShutdown()
+      with self.cv:
+        if self.shutdownRequested:
+          break
+        if self.__isQuiescent():
+          self.__requestShutdown()
+    self.__doNotifications()
+    for t in self.workers:
+      t.join()
+    self.jobs[self.final_job] = {"scheduler": "serial", "deps": list(self.jobs.keys()), "spec": None, "state": State.RUNNING}
+    self.stateCounter[self.jobs[self.final_job]["state"]] += 1
+    if self.stateCounter[State.BROKEN]:
+      self.set_state(self.final_job, State.BROKEN)
+    else:
+      self.set_state(self.final_job, State.DONE)
+    return
+
+  def __workerLoop(self):
+    while True:
+      pri, taskId, item = self.workersQueue.get()
+      if taskId == "__QUIT__": return
+      with self.cv:
+        self.activeTasks += 1
+      try:
+        result = item[0](*item[1:])
+      except Exception as e:
+        s = StringIO()
+        traceback.print_exc(file=s)
+        result = s.getvalue()
+      if not self.__workerDone(taskId, result, item):
+        return
+
+  def __requestShutdown(self):
+    with self.cv:
+      if self.shutdownRequested:
+        return
+      self.shutdownRequested = True
+    for _ in self.workers:
+        self.workersQueue.put((1, "__QUIT__", None))
+
+  def __workerDone(self, taskId, result, item):
+    with self.cv:
+      self.activeTasks -= 1
+      self.cv.notify_all()
+    if self.resourceManager and taskId.startswith('build-'):
+      self.notifyMaster(self.resourceManager.releaseResourcesForExternal, taskId)
+    if isinstance(result, _SchedulerQuitCommand):
+      self.notifyTaskMaster(self.__releaseWorker)
+      return False
+    if result:
+      self.log(str(item) + " failed.\n"+result)
+    else:
+      self.log(str(item) + " done")
+    self.notifyTaskMaster(self.__updateJobStatus, taskId, result, True)
+    return True
+
+  def __isQuiescent(self):
+    # caller must hold self.cv
+    return (
+        self.activeTasks == 0 and
+        self.stateCounter[State.PENDING] == 0 and
+        self.stateCounter[State.RUNNING] == 0
+    )
+
+  def __isSerialTaskReady(self, taskId):
+    for d in self.jobs[taskId]["deps"]:
+      if not d in self.jobs:
+        return False
+      if self.jobs[d]["state"] == State.BROKEN:
+        return True
+      if self.jobs[d]["state"] != State.DONE:
+        return False
+    return True
+
+  def __updateTasks(self, taskId):
+    for depTask in self.reverseDeps.get(taskId, set()):
+      if self.jobs[depTask]["state"] != State.PENDING:
+        continue
+      if self.jobs[depTask]["scheduler"] == "serial":
+        if self.__isSerialTaskReady(depTask):
+          self.notifyMaster(self.__enqueueSerial, depTask)
+    return
+
+  def __enqueueSerial(self, taskId):
+    if self.jobs[taskId]["state"] != State.PENDING:
+      return
+    if taskId in self.serialEnqueued:
+      return
+    self.serialEnqueued.add(taskId)
+    self.resultsQueue.put((threading.currentThread(), self.jobs[taskId]["spec"]))
 
   def __doNotifications(self):
-    self.rescheduleParallel = False
-    while self.notifyQueue.qsize():
-      who, item = self.notifyQueue.get()
-      item[0](*item[1:])
-    if self.rescheduleParallel:
-       self.__doRescheduleParallel()
+    while True:
+      try:
+        who, item = self.notifyQueue.get_nowait()
+        item[0](*item[1:])
+      except Empty:
+        break
+    if not self.shutdownRequested:
+      self.__doRescheduleParallel()
 
   def __releaseWorker(self):
     self.parallelThreads -= 1
 
-  def parallel(self, taskId, deps, *spec):
-    if taskId in self.jobs: return
-    self.jobs[taskId] = {"scheduler": "parallel", "deps": deps, "spec":spec, "priorty": 1}
-    if taskId.split("-")[0] in ["build", "download", "fetch"]:
-      try:
-          self.jobs[taskId]["priorty"] = 100000-spec[1].requiredBy
-      except:
-          self.jobs[taskId]["priorty"] = 1
-    self.pendingJobs.append(taskId)
-    self.finalJobDeps.append(taskId)
+  def __addPending(self, taskId):
+    for dep in self.jobs[taskId]["deps"]:
+      self.reverseDeps.setdefault(dep, set()).add(taskId)
+    self.stateCounter[State.PENDING] += 1
+    if self.jobs[taskId]["scheduler"] == "serial":
+      if self.__isSerialTaskReady(taskId):
+        self.notifyMaster(self.__enqueueSerial, taskId)
+    return
 
-  # Does the rescheduling of tasks. Derived class should call it.
-  def __rescheduleParallel(self):
-    self.rescheduleParallel = True
+  def parallel(self, taskId, deps, *spec):
+    if threading.current_thread() is not self.masterThread:
+      self.notifyMaster(
+        self.__parallelImpl,
+        taskId,
+        deps,
+        *spec
+      )
+      return
+    self.__parallelImpl(taskId, deps, *spec)
+
+  def __parallelImpl(self, taskId, deps, *spec):
+    if taskId in self.jobs: return
+    self.jobs[taskId] = {"scheduler": "parallel", "deps": deps, "spec":spec, "priorty": 1, "task_type": "force", "state": State.PENDING}
+    task_types = taskId.split("-")
+    if (len(task_types)>1) and (task_types[0] in ["build", "download", "fetch"]):
+      self.jobs[taskId]["task_type"] = task_types[0]
+      try:
+        self.jobs[taskId]["priorty"] = 100000-spec[1].requiredBy
+      except:
+        self.jobs[taskId]["priorty"] = 1
+    self.__addPending(taskId)
 
   def __doRescheduleParallel(self):
-    parallelJobs = [j for j in self.pendingJobs if self.jobs[j]["scheduler"] == "parallel"]
+    parallelJobs = [j for j in self.jobs if (self.jobs[j]["scheduler"] == "parallel") and (self.jobs[j]["state"] == State.PENDING)]
     # First of all clean up the pending parallel jobs from all those
     # which have broken dependencies.
     while True:
       has_broken = False
       for taskId in parallelJobs[:]:
-        brokenDeps = [dep for dep in self.jobs[taskId]["deps"] if dep in self.brokenJobs]
+        brokenDeps = [dep for dep in self.jobs[taskId]["deps"] if self.jobs[dep]["state"] == State.BROKEN]
         if not brokenDeps:
           continue
         has_broken = True
         parallelJobs.remove(taskId)
-        transition(taskId, self.pendingJobs, self.brokenJobs, "parallel:pending->broken")
+        self.set_state(taskId, State.BROKEN)
         self.errors[taskId] = "The following dependencies could not complete:\n%s" % "\n".join(brokenDeps)
+        self.__updateTasks(taskId)
       if not has_broken:
         break
 
     # If no tasks left, quit. Notice we need to check also for serial jobs
     # since they might queue more parallel payloads.
-    if not self.pendingJobs:
-      self.shout(self.quit)
-      self.notifyTaskMaster(self.quit)
+    if not self.stateCounter[State.PENDING]:
       return
-
-    # Otherwise do another round of scheduling of all the tasks. In this
-    # case we only queue parallel jobs to the parallel queue.
-    dumpMsg = (self.runningJobsCache != self.runningJobs)
-    if dumpMsg:
-      self.runningJobsCache = self.runningJobs[:]
-      self.log("Running tasks: %s" % self.runningJobs,30)
 
     allJobs =[]
     for taskId in parallelJobs:
-      pendingDeps = [dep for dep in self.jobs[taskId]["deps"] if not dep in self.doneJobs]
+      pendingDeps = [dep for dep in self.jobs[taskId]["deps"] if self.jobs[dep]["state"] != State.DONE]
       if pendingDeps:
-        if dumpMsg:
-          self.log("Pending tasks: %s: %s" % (taskId, pendingDeps),30)
         continue
-      if taskId in self.pendingJobs:
+      if self.jobs[taskId]["state"] == State.PENDING:
         allJobs.append({"id": taskId, "priorty": self.jobs[taskId]["priorty"]})
     buildJobs =[]
     downloadJobs = []
@@ -189,7 +272,7 @@ class Scheduler(object):
     dwnCount = self.runningJobsCount["max_download"]-self.runningJobsCount["download"]
     for task in sorted(allJobs, key=lambda k: k['priorty']):
       taskId = task["id"]
-      taskType = taskId.split("-")[0]
+      taskType = self.jobs[taskId]["task_type"]
       if taskType == "download":
         if dwnCount>0:
           downloadJobs.append(taskId)
@@ -205,23 +288,23 @@ class Scheduler(object):
       else:
         buildJobs = buildJobs[:bldCount]
     for taskId in forceJobs + downloadJobs + buildJobs:
-      if transition(taskId, self.pendingJobs, self.runningJobs, "parallel:pending->running"):
-        taskType = taskId.split("-")[0]
-        self.runningJobsCount[taskType] += 1
-        self.__scheduleParallel(taskId, self.jobs[taskId]["spec"], priorty=self.jobs[taskId]["priorty"])
-      elif self.resourceManager:
-        self.resourceManager.releaseResourcesForExternal(taskId)
+      self.set_state(taskId, State.RUNNING)
+      self.runningJobsCount[self.jobs[taskId]["task_type"]] += 1
+      self.__scheduleParallel(taskId, self.jobs[taskId]["spec"], priorty=self.jobs[taskId]["priorty"])
 
   # Update the job with the result of running.
-  def __updateJobStatus(self, taskId, error):
-    taskType = taskId.split("-")[0]
-    if taskType in self.runningJobsCount:
-      self.runningJobsCount[taskType] -= 1
+  def __updateJobStatus(self, taskId, error, parallel = True):
+    if parallel:
+      self.runningJobsCount[self.jobs[taskId]["task_type"]] -= 1
+    else:
+      self.serialEnqueued.discard(taskId)
     if not error:
-      transition(taskId, self.runningJobs, self.doneJobs, "status:running->done")
-      return
-    transition(taskId, self.runningJobs, self.brokenJobs, "status:running->broken")
-    self.errors[taskId] = error
+      self.set_state(taskId, State.DONE)
+    else:
+      self.set_state(taskId, State.BROKEN)
+      self.errors[taskId] = error
+    self.__updateTasks(taskId)
+    self.reverseDeps.pop(taskId, None)
   
   # One task at the time.
   def __scheduleParallel(self, taskId, commandSpec, priorty=1):
@@ -240,50 +323,53 @@ class Scheduler(object):
     self.notifyQueue.put((threading.currentThread(), commandSpec))
 
   def forceDone(self, taskId):
-    if taskId in self.doneJobs: return
-    if not taskId in self.jobs: self.jobs[taskId]={}
-    if not taskId in self.pendingJobs: self.pendingJobs.append(taskId)
-    transition(taskId, self.pendingJobs, self.doneJobs, "Force:pending->done")
-    
+    if threading.current_thread() is not self.masterThread:
+      self.notifyMaster(self.__forceDoneImpl,taskId)
+      return
+    self.__forceDoneImpl(taskId, deps, *commandSpec)
+
+  def __forceDoneImpl(self, taskId):
+    if not taskId in self.jobs:
+      self.jobs[taskId]={"scheduler": "serial", "state": State.PENDING}
+      self.stateCounter[State.PENDING] +=1
+    if self.jobs[taskId]["state"] in [State.DONE, State.BROKEN]: return
+    parallel = (self.jobs[taskId]["scheduler"] == "parallel")
+    self.set_state(taskId, State.RUNNING)
+    self.__updateJobStatus(taskId, "", parallel)
+
   def serial(self, taskId, deps, *commandSpec):
+    if threading.current_thread() is not self.masterThread:
+      self.notifyMaster(
+        self.__serialImpl,
+        taskId,
+        deps,
+        *commandSpec
+      )
+      return
+    self.__serialImpl(taskId, deps, *commandSpec)
+
+  def __serialImpl(self, taskId, deps, *commandSpec):
     if taskId in self.jobs: return
     spec = [self.doSerial, taskId, deps] + list(commandSpec)
-    self.resultsQueue.put((threading.currentThread(), spec))
-    self.jobs[taskId] = {"scheduler": "serial", "deps": deps, "spec": spec}
-    self.pendingJobs.append(taskId)
-    self.finalJobDeps.append(taskId)
+    self.jobs[taskId] = {"scheduler": "serial", "deps": deps, "spec": spec, "state": State.PENDING}
+    self.__addPending(taskId)
 
   def doSerial(self, taskId, deps, *commandSpec):
-    pendingDeps = [dep for dep in deps if not dep in self.doneJobs]
-    brokenDeps = [dep for dep in deps if dep in self.brokenJobs]
+    brokenDeps = [dep for dep in deps if self.jobs[dep]["state"] == State.BROKEN]
+    self.set_state(taskId, State.RUNNING)
     if brokenDeps:
-      #put back if there are other pending tasks
-      if [dep for dep in pendingDeps if not dep in brokenDeps]:
-        self.resultsQueue.put((threading.currentThread(), [self.doSerial, taskId, deps] + list(commandSpec)))
-        return
-      transition(taskId, self.pendingJobs, self.brokenJobs, "serial:pending->broken")
-      self.errors[taskId] = "The following dependencies could not complete:\n%s" % "\n".join(brokenDeps)
-      # Remember to do the scheduling again!
-      self.notifyMaster(self.__rescheduleParallel)
+      error = "The following dependencies could not complete:\n%s" % "\n".join(brokenDeps)
+      self.__updateJobStatus(taskId, error, parallel = False)
       return
-    
-    # Put back the task on the queue, since it has pending dependencies.
-    if pendingDeps:
-      self.resultsQueue.put((threading.currentThread(), [self.doSerial, taskId, deps] + list(commandSpec)))
-      return
-    # No broken dependencies and no pending ones. Run the job.
-    if not (taskId in self.doneJobs):
-      transition(taskId, self.pendingJobs, self.runningJobs, "serial:pending->running")
-      try:
-        result = commandSpec[0](*commandSpec[1:])
-      except Exception as e:
-        s = StringIO()
-        traceback.print_exc(file=s)
-        result = s.getvalue()
-      self.__updateJobStatus(taskId, result)
-    # Remember to do the scheduling again!
-    self.notifyMaster(self.__rescheduleParallel)
-  
+    result = ""
+    try:
+      result = commandSpec[0](*commandSpec[1:])
+    except Exception as e:
+      s = StringIO()
+      traceback.print_exc(file=s)
+      result = s.getvalue()
+    self.__updateJobStatus(taskId, result, parallel = False)
+ 
   # Helper method to do logging:
   def log(self, s, level=0):
     self.notifyMaster(self.logDelegate, s, level)
@@ -298,7 +384,7 @@ class Scheduler(object):
     print (s)
 
   def reschedule(self):
-    self.notifyMaster(self.__rescheduleParallel)
+    pass
 
 def dummyTask():
   sleep(0.1)
@@ -314,126 +400,199 @@ def exceptionTask():
 
 # Mimics cmsBuild workflow.
 def scheduleMore(scheduler):
-  scheduler.parallel("download", [], dummyTask)
-  scheduler.parallel("build", ["download"], dummyTask)
-  scheduler.serial("install", ["build"], dummyTask)
+  scheduler.parallel("download-file", [], dummyTask)
+  scheduler.parallel("build-test", ["download-file"], dummyTask)
+  scheduler.serial("install", ["build-test"], dummyTask)
+
+def run_test(scheduler, skip_run=False):
+  if not skip_run:
+    scheduler.run()
+  assert(len(scheduler.serialEnqueued)==0)
+  if scheduler.stateCounter[State.BROKEN]:
+    assert(len(scheduler.brokenOrdered)>=1)
+    assert(scheduler.brokenOrdered[-1] == scheduler.final_job)
+  elif scheduler.stateCounter[State.DONE]:
+    assert(len(scheduler.doneOrdered)>=1)
+    assert(scheduler.doneOrdered[-1] == scheduler.final_job)
+  assert(scheduler.stateCounter[State.BROKEN]+scheduler.stateCounter[State.DONE] ==
+         len(scheduler.brokenOrdered)+len(scheduler.doneOrdered))
+  for state in [State.UNKNOWN, State.PENDING, State.RUNNING]:
+    if scheduler.stateCounter[state] != 0:
+      print(scheduler.stateCounter)
+    assert(scheduler.stateCounter[state]==0) 
+  for item in scheduler.runningJobsCount.keys():
+    if item.startswith("max_"):
+      continue
+    assert(scheduler.runningJobsCount[item]==0)
+  for task_id, job in scheduler.jobs.items():
+    for dep in job.get("deps", []):
+        if scheduler.jobs[dep]["state"] == State.DONE:
+            assert(dep in scheduler.doneJobs)
+            assert(dep in scheduler.doneOrdered)
+  for task_id in scheduler.doneJobs:
+    #if task_id == scheduler.final_job:
+    #    continue
+    for dep in scheduler.jobs[task_id]["deps"]:
+        assert(dep in scheduler.doneJobs)
+        assert(dep in scheduler.doneOrdered)
+  all_jobs = set(scheduler.jobs.keys())
+  assert all(
+    scheduler.jobs[j]["state"] in (State.DONE, State.BROKEN)
+    for j in all_jobs
+  )
+  if not scheduler.stateCounter[State.BROKEN]:
+    print("HERE:",scheduler.reverseDeps)
+    assert(len(scheduler.reverseDeps)==0)
 
 if __name__ == "__main__":
+  from test_scheduler import RandomSchedulerTest
   scheduler = Scheduler(10)
-  scheduler.run()
+  test = RandomSchedulerTest(
+    scheduler,
+    initial_jobs=500,
+    max_deps=10,
+    dynamic_job_probability=0.2,
+    serial_probability=0.25,
+    failure_probability=0.01,
+    seed=12345
+  )
+  test.run()
+  print("Done:", scheduler.stateCounter[State.DONE])
+  print("Broken:", scheduler.stateCounter[State.BROKEN])
+  run_test(scheduler, True)
+
+  scheduler = Scheduler(10)
+  run_test(scheduler)
 
   scheduler = Scheduler(1)
-  scheduler.run()
+  run_test(scheduler)
   
   scheduler = Scheduler(10)
   scheduler.parallel("test", [], scheduler.log, "This is england");
-  scheduler.run()
+  run_test(scheduler)
 
   scheduler = Scheduler(1)
   for x in range(10):
     scheduler.parallel("test", [], dummyTask)
     scheduler.serial("test", [], dummyTask)
-  scheduler.run()
-  # Notice we have only 2 jobs because there is always a toplevel one
-  # which depends on all the others.
-  assert(len(scheduler.brokenJobs) == 0)
+  run_test(scheduler)
+  assert(scheduler.stateCounter[State.BROKEN] == 0)
   assert(len(scheduler.jobs) == 2)
-  
+
   scheduler = Scheduler(10)
   for x in range(50):
     scheduler.parallel("test" + str(x), [], dummyTask)
-  scheduler.run()
-  # Notice we have 51 jobs because there is always a toplevel one
-  # which depends on all the others.
-  assert(len(scheduler.brokenJobs) == 0)
+  run_test(scheduler)
+  assert(scheduler.stateCounter[State.BROKEN] == 0)
   assert(len(scheduler.jobs) == 51)
-  
+
   scheduler = Scheduler(1)
   scheduler.parallel("test", [], errorTask)
-  scheduler.run()
+  run_test(scheduler)
   # Again, since the toplevel one always depend on all the others
   # it is always broken if something else is brokend.
-  assert(len(scheduler.brokenJobs) == 2)
-  assert(len(scheduler.runningJobs) == 0)
-  assert(len(scheduler.doneJobs) == 0)
-  
+  assert(scheduler.stateCounter[State.BROKEN] == 2)
+  assert(scheduler.stateCounter[State.DONE] == 0)
+
   # Check dependency actually works.
   scheduler = Scheduler(10)
   scheduler.parallel("test2", ["test1"], dummyTask)
   scheduler.parallel("test1", [], dummyTaskLong) 
-  scheduler.run()
-  assert(scheduler.doneJobs == ["test1", "test2", "final-job"])
+  run_test(scheduler)
+  assert(scheduler.doneOrdered == ["test1", "test2", scheduler.final_job])
 
   # Check dependency actually works.
   scheduler = Scheduler(10)
-  scheduler.parallel("test3", ["test2"], dummyTask)
-  scheduler.parallel("test2", ["test1"], errorTask)
-  scheduler.parallel("test1", [], dummyTaskLong) 
-  scheduler.run()
-  assert(scheduler.doneJobs == ["test1"])
-  assert(scheduler.brokenJobs == ["test2", "test3", "final-job"])
+  scheduler.parallel("build-test3", ["build-test2"], dummyTask)
+  scheduler.parallel("build-test2", ["build-test1"], errorTask)
+  scheduler.parallel("build-test1", [], dummyTaskLong) 
+  run_test(scheduler)
+  assert(scheduler.doneOrdered == ["build-test1"])
+  assert(scheduler.brokenOrdered == ["build-test2", "build-test3", scheduler.final_job])
 
   # Check ctrl-C will exit properly.
   scheduler = Scheduler(2)
+  doneOrdered = ["build-test" + str(x) for x in range(250)]
+  for x in doneOrdered:
+    scheduler.parallel(x, [], dummyTask)
+  print ("Print Control-C to continue")
+  run_test(scheduler)
+  doneOrdered.append(scheduler.final_job)
+  assert(scheduler.stateCounter[State.DONE] == len(doneOrdered))
+  assert(scheduler.doneJobs == set(doneOrdered))
+
+  scheduler = Scheduler(16)
   for x in range(250):
     scheduler.parallel("test" + str(x), [], dummyTask)
   print ("Print Control-C to continue")
-  scheduler.run()
+  run_test(scheduler)
+
+  scheduler = Scheduler(2)
+  doneOrdered = ["test" + str(x) for x in range(250)]
+  for x in doneOrdered:
+    scheduler.serial(x, [], dummyTask)
+  run_test(scheduler)
+  doneOrdered.append(scheduler.final_job)
+  assert(scheduler.doneOrdered == doneOrdered)
+  assert(scheduler.stateCounter[State.DONE] == len(doneOrdered))
+  assert(scheduler.doneJobs == set(doneOrdered))
 
   # Handle tasks with exceptions.
   scheduler = Scheduler(2)
-  scheduler.parallel("test", [], exceptionTask)
-  scheduler.run()
-  assert(scheduler.errors["test"])
+  scheduler.parallel("build-test", [], exceptionTask)
+  run_test(scheduler)
+  assert(scheduler.errors["build-test"])
 
   # Handle tasks which depend on tasks with exceptions.
   scheduler = Scheduler(2)
-  scheduler.parallel("test0", [], dummyTask)
-  scheduler.parallel("test1", [], exceptionTask)
-  scheduler.parallel("test2", ["test1"], dummyTask)
-  scheduler.run()
-  assert(scheduler.errors["test1"])
-  assert(scheduler.errors["test2"])
+  scheduler.parallel("build-test0", [], dummyTask)
+  scheduler.parallel("build-test1", [], exceptionTask)
+  scheduler.parallel("build-test2", ["build-test1"], dummyTask)
+  run_test(scheduler)
+  assert(scheduler.errors["build-test1"])
+  assert(scheduler.errors["build-test2"])
 
   # Handle serial execution tasks.
   scheduler = Scheduler(2)
   scheduler.serial("test0", [], dummyTask)
-  scheduler.run()
-  assert(scheduler.doneJobs == ["test0", "final-job"])
+  run_test(scheduler)
+  assert(scheduler.doneOrdered == ["test0", scheduler.final_job])
 
   # Handle serial execution tasks, one depends from
   # the previous one.
   scheduler = Scheduler(2)
   scheduler.serial("test0", [], dummyTask)
   scheduler.serial("test1", ["test0"], dummyTask)
-  scheduler.run()
-  assert(scheduler.doneJobs == ["test0", "test1", "final-job"])
+  run_test(scheduler)
+  assert(scheduler.doneOrdered == ["test0", "test1", scheduler.final_job])
 
   # Serial tasks depending on one another.
   scheduler = Scheduler(2)
   scheduler.serial("test1", ["test0"], dummyTask)
   scheduler.serial("test0", [], dummyTask)
-  scheduler.run()
-  assert(scheduler.doneJobs == ["test0", "test1", "final-job"])
+  run_test(scheduler)
+  assert(scheduler.doneOrdered == ["test0", "test1", scheduler.final_job])
 
   # Serial and parallel tasks being scheduled at the same time.
   scheduler = Scheduler(2)
   scheduler.serial("test1", ["test0"], dummyTask)
   scheduler.serial("test0", [], dummyTask)
-  scheduler.parallel("test2", [], dummyTask)
-  scheduler.parallel("test3", [], dummyTask)
-  scheduler.run()
-  scheduler.doneJobs.sort()
-  assert(scheduler.doneJobs == ["final-job", "test0", "test1", "test2", "test3"])
+  scheduler.parallel("build-test2", [], dummyTask)
+  scheduler.parallel("build-test3", [], dummyTask)
+  run_test(scheduler)
+  scheduler.doneOrdered.sort()
+  doneOrdered = ["build-test2", "build-test3", scheduler.final_job, "test0", "test1"]
+  assert(scheduler.doneOrdered == doneOrdered)
+  assert(scheduler.stateCounter[State.DONE] == len(doneOrdered))
 
   # Serial and parallel tasks. Parallel depends on serial.
   scheduler = Scheduler(2)
   scheduler.serial("test1", ["test0"], dummyTask)
   scheduler.serial("test0", [], dummyTask)
-  scheduler.parallel("test2", ["test1"], dummyTask)
-  scheduler.parallel("test3", ["test2"], dummyTask)
-  scheduler.run()
-  assert(scheduler.doneJobs == ["test0", "test1", "test2", "test3", "final-job"])
+  scheduler.parallel("build-test2", ["test1"], dummyTask)
+  scheduler.parallel("build-test3", ["build-test2"], dummyTask)
+  run_test(scheduler)
+  assert(scheduler.doneOrdered == ["test0", "test1", "build-test2", "build-test3", scheduler.final_job])
 
   # Serial task scheduling two parallel task and another dependent
   # serial task. This is actually what needs to be done for building 
@@ -443,5 +602,5 @@ if __name__ == "__main__":
   # one and finally the install built package one.
   scheduler = Scheduler(3)
   scheduler.serial("check-pkg", [], scheduleMore, scheduler)
-  scheduler.run()
-  assert(scheduler.doneJobs == ["check-pkg", "download", "build", "install", "final-job"])
+  run_test(scheduler)
+  assert(scheduler.doneOrdered == ["check-pkg", "download-file", "build-test", "install", scheduler.final_job])
