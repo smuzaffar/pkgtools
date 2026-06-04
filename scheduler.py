@@ -45,7 +45,6 @@ class Scheduler(object):
     self.notifyQueue = Queue()
     self.readyQueue = Queue()
     self.parallelReady = {}
-    self.serialEnqueued = set()
     self.jobs = {}
     self.reverseDeps = {}
     self.stateCounter = {}
@@ -147,13 +146,12 @@ class Scheduler(object):
     if self.resourceManager and taskId.startswith('build-'):
       self.notifyMaster(self.resourceManager.releaseResourcesForExternal, taskId)
     if isinstance(result, _SchedulerQuitCommand):
-      self.notifyTaskMaster(self.__releaseWorker)
       return False
     if result:
       self.log(str(item) + " failed.\n"+result)
     else:
       self.log(str(item) + " done")
-    self.notifyTaskMaster(self.__updateJobStatus, taskId, result, True)
+    self.resultsQueue.put((threading.currentThread(), (self.__updateJobStatus, taskId, result, True)))
     return True
 
   def __isQuiescent(self):
@@ -161,6 +159,8 @@ class Scheduler(object):
         self.activeTasks == 0 and
         self.stateCounter[State.PENDING] == 0 and
         self.stateCounter[State.RUNNING] == 0 and
+        self.readyQueue.empty() and
+        not self.parallelReady and
         self.notifyQueue.empty() and
         self.resultsQueue.empty()
     )
@@ -172,9 +172,6 @@ class Scheduler(object):
         item[0](*item[1:])
       except Empty:
         break
-
-  def __releaseWorker(self):
-    self.parallelThreads -= 1
 
   def __tryActivate(self, taskId):
     job = self.jobs[taskId]
@@ -259,7 +256,6 @@ class Scheduler(object):
       if job["state"] != State.PENDING:
         continue
       if job["scheduler"] == "serial":
-        self.set_state(taskId, State.RUNNING)
         self.resultsQueue.put((threading.current_thread(), job["spec"]))
       else:
         self.parallelReady[taskId] = job
@@ -298,8 +294,6 @@ class Scheduler(object):
   def __updateJobStatus(self, taskId, error, parallel = True):
     if parallel:
       self.runningJobsCount[self.jobs[taskId]["task_type"]] -= 1
-    else:
-      self.serialEnqueued.discard(taskId)
     if not error:
       self.set_state(taskId, State.DONE)
     else:
@@ -315,15 +309,6 @@ class Scheduler(object):
   # One task at the time.
   def __scheduleParallel(self, taskId, commandSpec, priorty=1):
     self.workersQueue.put((priorty, taskId, commandSpec))
-
-  # Helper to enqueue commands for all the threads.
-  def shout(self, *commandSpec):
-    for x in range(self.parallelThreads):
-      self.__scheduleParallel("quit-" + str(x), commandSpec)
-
-  # Helper to enqueu replies to the master thread.
-  def notifyTaskMaster(self, *commandSpec):
-    self.resultsQueue.put((threading.currentThread(), commandSpec))
 
   def notifyMaster(self, *commandSpec):
     self.notifyQueue.put((threading.currentThread(), commandSpec))
@@ -363,7 +348,7 @@ class Scheduler(object):
   def doSerial(self, taskId, deps, *commandSpec):
     brokenDeps = [dep for dep in deps if self.jobs[dep]["state"] == State.BROKEN]
     print("HERE",taskId, self.jobs[taskId])
-    #self.set_state(taskId, State.RUNNING)
+    self.set_state(taskId, State.RUNNING)
     if brokenDeps:
       error = "The following dependencies could not complete:\n%s" % "\n".join(brokenDeps)
       self.__updateJobStatus(taskId, error, parallel = False)
@@ -414,7 +399,6 @@ def scheduleMore(scheduler):
 def run_test(scheduler, skip_run=False):
   if not skip_run:
     scheduler.run()
-  assert(len(scheduler.serialEnqueued)==0)
   if scheduler.stateCounter[State.BROKEN]:
     assert(len(scheduler.brokenOrdered)>=1)
     assert(scheduler.brokenOrdered[-1] == scheduler.final_job)
