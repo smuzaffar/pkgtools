@@ -57,43 +57,29 @@ class Scheduler(object):
     self.workers = []
     self.masterThread = threading.current_thread()
     self.final_job = "final-job"
+    self.runtimeError = []
     if not logDelegate:
       self.logDelegate = self.__doLog 
     if buildStats:
       self.resourceManager = ResourceManager(buildStats, self)
 
   def run(self):
-    for i in range(self.parallelThreads):
-      t = Thread(target=self.__processParallel)
-      self.workers.append(t)
-      t.start()
-    while True:
+    assert(self.masterThread == threading.current_thread())
+    try:
+      self.__run()
+    finally:
+      self.__requestShutdown()
       self.__doNotifications()
-      try:
-        who, item = self.resultsQueue.get(timeout=0.1)
-        item[0](*item[1:])
-      except Empty:
-        pass
-      except KeyboardInterrupt:
-        print("Ctrl-C received, shutting down")
-        self.__requestShutdown()
-      with self.cv:
-        if self.shutdownRequested:
-          break
-        if self.__isQuiescent():
-          self.__requestShutdown()
-    self.__doNotifications()
-    for t in self.workers:
-      t.join()
-    self.__doNotifications()
-    self.__addJob("serial", self.final_job, list(self.jobs.keys()), False, [])
-    self.__setState(self.final_job, State.RUNNING)
-    if self.stateCounter[State.BROKEN]:
-      self.__setState(self.final_job, State.BROKEN)
-    else:
-      self.__setState(self.final_job, State.DONE)
-    self.__doNotifications()
-    return
+      for t in self.workers:
+        t.join()
+      self.__doNotifications()
+      self.__addJob("serial", self.final_job, list(self.jobs.keys()), False, [])
+      self.__setState(self.final_job, State.RUNNING)
+      if self.stateCounter[State.BROKEN]:
+        self.__setState(self.final_job, State.BROKEN)
+      else:
+        self.__setState(self.final_job, State.DONE)
+      self.__doNotifications()
 
   def parallel(self, taskId, deps, *spec):
     if threading.current_thread() is not self.masterThread:
@@ -124,11 +110,35 @@ class Scheduler(object):
   def log(self, s, level=0):
     self.notifyMaster(self.logDelegate, s, level)
 
+  def __run(self):
+    assert(self.masterThread == threading.current_thread())
+    for i in range(self.parallelThreads):
+      t = Thread(target=self.__processParallel)
+      self.workers.append(t)
+      t.start()
+    while True:
+      self.__doNotifications()
+      try:
+        who, item = self.resultsQueue.get(timeout=0.1)
+        item[0](*item[1:])
+      except Empty:
+        pass
+      except KeyboardInterrupt:
+        print("Ctrl-C received, shutting down")
+        self.__requestShutdown()
+      with self.cv:
+        if self.shutdownRequested:
+          break
+        if self.__isQuiescent():
+          break
+    return
+
   def __setState(self, taskId, new_state):
     assert(self.masterThread == threading.current_thread())
     old = self.jobs[taskId]["state"]
     self.log("Chaning job state %s: %s -> %s" % (taskId, old, new_state), 30)
-    assert(old != new_state)
+    if old == new_state:
+      self.__runtimeError(f"Duplicate transition {old} -> {new_state}")
     if old in (State.DONE, State.BROKEN):
       self.__runtimeError(f"Illegal transition {old} -> {new_state} for {taskId}")
     self.jobs[taskId]["state"] = new_state
@@ -358,7 +368,6 @@ class Scheduler(object):
  
   def __runtimeError(self, error):
     assert(threading.current_thread() == self.masterThread)
-    self.__requestShutdown()
     raise RuntimeError(error)
 
   # Helper for printouts.
@@ -429,6 +438,7 @@ def run_test(scheduler, skip_run=False):
   print("Default checks passed")
 
 if __name__ == "__main__":
+ if True:
   from test_scheduler import RandomSchedulerTest
   scheduler = Scheduler(10)
   test = RandomSchedulerTest(
@@ -445,6 +455,7 @@ if __name__ == "__main__":
   print("Broken:", scheduler.stateCounter[State.BROKEN])
   run_test(scheduler, True)
 
+ if True:
   scheduler = Scheduler(8)
   for i in range(100):
     if i % 2:
@@ -463,7 +474,7 @@ if __name__ == "__main__":
   scheduler = Scheduler(10)
   scheduler.parallel("test", [], scheduler.log, "This is england");
   run_test(scheduler)
-
+ if True:
   scheduler = Scheduler(1)
   for x in range(10):
     scheduler.parallel("test", [], dummyTask)
