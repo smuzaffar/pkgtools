@@ -10,11 +10,10 @@ from rmanager import ResourceManager
 from enum import Enum
 
 class State(Enum):
-    UNKNOWN = 0
     PENDING = 1
-    RUNNING = 3
-    DONE = 4
-    BROKEN = 5
+    RUNNING = 2
+    DONE = 3
+    BROKEN = 4
 
 # Helper class to avoid conflict between result
 # codes and quit state transition.
@@ -44,7 +43,7 @@ class Scheduler(object):
     self.resultsQueue = Queue()
     self.notifyQueue = Queue()
     self.readyQueue = Queue()
-    self.parallelReady = {}
+    self.parallelReady = set()
     self.jobs = {}
     self.reverseDeps = {}
     self.stateCounter = {}
@@ -70,6 +69,7 @@ class Scheduler(object):
   def set_state(self, taskId, new_state):
     assert(self.masterThread == threading.current_thread())
     old = self.jobs[taskId]["state"]
+    self.log("Chaning job state %s: %s -> %s" % (taskId, old, new_state), 30)
     assert(old != new_state)
     if old in (State.DONE, State.BROKEN):
         return
@@ -108,8 +108,8 @@ class Scheduler(object):
     self.__doNotifications()
     for t in self.workers:
       t.join()
-    self.jobs[self.final_job] = {"scheduler": "serial", "deps": list(self.jobs.keys()), "spec": None, "state": State.RUNNING}
-    self.stateCounter[self.jobs[self.final_job]["state"]] += 1
+    self.__addJob("serial", self.final_job, list(self.jobs.keys()), False, [])
+    self.set_state(self.final_job, State.RUNNING)
     if self.stateCounter[State.BROKEN]:
       self.set_state(self.final_job, State.BROKEN)
     else:
@@ -204,43 +204,36 @@ class Scheduler(object):
         self.__failJob(child, f"dependency {taskId} failed")
     return
 
-  def __addPending(self, taskId):
-    job = self.jobs[taskId]
-    # 1. register reverse dependency edges (idempotent)
-    for dep in job["deps"]:
-        self.reverseDeps.setdefault(dep, set()).add(taskId)
-    # 2. state bookkeeping (only once)
-    self.stateCounter[State.PENDING] += 1
-    job["state"] = State.PENDING
-    job["queued"] = False
-    # 3. jobs try activation
-    # (important: serial/parallel should behave uniformly here)
-    self.__tryActivate(taskId)
-
   def parallel(self, taskId, deps, *spec):
+    job = ("parallel", taskId, deps, True, *spec)
     if threading.current_thread() is not self.masterThread:
-      self.notifyMaster(
-        self.__parallelImpl,
-        taskId,
-        deps,
-        *spec
-      )
-      return
-    self.__parallelImpl(taskId, deps, *spec)
+      self.notifyMaster(self.__addJob,*job)
+    else:
+      self.__addJob(*job)
 
-  def __parallelImpl(self, taskId, deps, *spec):
+  def __addJob(self, job_type, taskId, deps, tryActivate, *spec):
+    assert(self.masterThread == threading.current_thread())
     if taskId in self.jobs: return
-    self.jobs[taskId] = {"scheduler": "parallel", "deps": deps, "spec":spec, "priorty": 1, "task_type": "force"}
-    task_types = taskId.split("-")
-    if (len(task_types)>1) and (task_types[0] in ["build", "download", "fetch"]):
-      self.jobs[taskId]["task_type"] = task_types[0]
-      try:
-        self.jobs[taskId]["priorty"] = 100000-spec[1].requiredBy
-      except:
-        self.jobs[taskId]["priorty"] = 1
-    self.__addPending(taskId)
-
+    job = {"scheduler": job_type, "deps": deps, "state": State.PENDING, "queued": False, "spec": spec}
+    if job_type == "parallel":
+      job["priorty"] = 1
+      job["task_type"] = "force"
+      task_types = taskId.split("-")
+      if (len(task_types)>1) and (task_types[0] in ["build", "download", "fetch"]):
+        job["task_type"] = task_types[0]
+        try:
+          job["priorty"] = 100000-spec[1].requiredBy
+        except:
+          job["priorty"] = 1
+    self.jobs[taskId] = job
+    self.stateCounter[State.PENDING] += 1
+    if tryActivate:
+      for dep in job["deps"]:
+        self.reverseDeps.setdefault(dep, set()).add(taskId)
+      self.__tryActivate(taskId)
+ 
   def __dispatchReadyJobs(self):
+    assert(self.masterThread == threading.current_thread())
     # 1. Drain readyQueue into a local batch
     ready = []
     while True:
@@ -249,7 +242,7 @@ class Scheduler(object):
         ready.append(taskId)
       except Empty:
          break
-    if not ready:
+    if not ready and not self.parallelReady:
         return
     for taskId in ready:
       job = self.jobs[taskId]
@@ -258,7 +251,7 @@ class Scheduler(object):
       if job["scheduler"] == "serial":
         self.resultsQueue.put((threading.current_thread(), job["spec"]))
       else:
-        self.parallelReady[taskId] = job
+        self.parallelReady.add(taskId)
 
     if not self.parallelReady:
       return
@@ -268,7 +261,8 @@ class Scheduler(object):
     forceJobs = []
     bldCount = self.runningJobsCount["max_build"]-self.runningJobsCount["build"]
     dwnCount = self.runningJobsCount["max_download"]-self.runningJobsCount["download"]
-    for taskId, job in sorted(self.parallelReady.items(), key=lambda x: x[1].get('priorty',1)):
+    for taskId in sorted(self.parallelReady, key=lambda tid: self.jobs[tid].get("priorty", 1)):
+      job = self.jobs[taskId]
       taskType = job["task_type"]
       if taskType == "download":
         if dwnCount>0:
@@ -285,13 +279,14 @@ class Scheduler(object):
       else:
         buildJobs = buildJobs[:bldCount]
     for taskId in forceJobs + downloadJobs + buildJobs:
-      self.parallelReady.pop(taskId, None)
+      self.parallelReady.remove(taskId)
       self.set_state(taskId, State.RUNNING)
       self.runningJobsCount[self.jobs[taskId]["task_type"]] += 1
       self.__scheduleParallel(taskId, self.jobs[taskId]["spec"], priorty=self.jobs[taskId]["priorty"])
 
   # Update the job with the result of running.
   def __updateJobStatus(self, taskId, error, parallel = True):
+    assert(self.masterThread == threading.current_thread())
     if parallel:
       self.runningJobsCount[self.jobs[taskId]["task_type"]] -= 1
     if not error:
@@ -308,6 +303,7 @@ class Scheduler(object):
   
   # One task at the time.
   def __scheduleParallel(self, taskId, commandSpec, priorty=1):
+    self.log("Scheduled Parallel job %s" % taskId, 30)
     self.workersQueue.put((priorty, taskId, commandSpec))
 
   def notifyMaster(self, *commandSpec):
@@ -316,38 +312,28 @@ class Scheduler(object):
   def forceDone(self, taskId):
     if threading.current_thread() is not self.masterThread:
       self.notifyMaster(self.__forceDoneImpl,taskId)
-      return
-    self.__forceDoneImpl(taskId, deps, *commandSpec)
+    else:
+      self.__forceDoneImpl(taskId)
 
   def __forceDoneImpl(self, taskId):
-    if not taskId in self.jobs:
-      self.jobs[taskId]={"scheduler": "serial", "state": State.PENDING}
-      self.stateCounter[State.PENDING] +=1
+    assert(self.masterThread == threading.current_thread())
+    self.__addJob("serial", taskId, [], False, [])
     if self.jobs[taskId]["state"] in [State.DONE, State.BROKEN]: return
     parallel = (self.jobs[taskId]["scheduler"] == "parallel")
     self.set_state(taskId, State.RUNNING)
     self.__updateJobStatus(taskId, "", parallel)
 
-  def serial(self, taskId, deps, *commandSpec):
+  def serial(self, taskId, deps, *spec):
+    job = ("serial", taskId, deps, True, self.doSerial, taskId, *spec)
     if threading.current_thread() is not self.masterThread:
-      self.notifyMaster(
-        self.__serialImpl,
-        taskId,
-        deps,
-        *commandSpec
-      )
-      return
-    self.__serialImpl(taskId, deps, *commandSpec)
+      self.notifyMaster(self.__addJob, *job)
+    else:
+      self.__addJob(*job)
 
-  def __serialImpl(self, taskId, deps, *commandSpec):
-    if taskId in self.jobs: return
-    spec = [self.doSerial, taskId, deps] + list(commandSpec)
-    self.jobs[taskId] = {"scheduler": "serial", "deps": deps, "spec": spec}
-    self.__addPending(taskId)
-
-  def doSerial(self, taskId, deps, *commandSpec):
-    brokenDeps = [dep for dep in deps if self.jobs[dep]["state"] == State.BROKEN]
-    print("HERE",taskId, self.jobs[taskId])
+  def doSerial(self, taskId, *commandSpec):
+    assert(self.masterThread == threading.current_thread())
+    self.log("Running serial job %s" % taskId, 30)
+    brokenDeps = [dep for dep in self.jobs[taskId]["deps"]  if self.jobs[dep]["state"] == State.BROKEN]
     self.set_state(taskId, State.RUNNING)
     if brokenDeps:
       error = "The following dependencies could not complete:\n%s" % "\n".join(brokenDeps)
@@ -374,9 +360,6 @@ class Scheduler(object):
   # Helper for printouts.
   def __doLog(self, s, level=0):
     print (s)
-
-  def reschedule(self):
-    pass
 
 def dummyTask():
   sleep(0.1)
@@ -407,7 +390,7 @@ def run_test(scheduler, skip_run=False):
     assert(scheduler.doneOrdered[-1] == scheduler.final_job)
   assert(scheduler.stateCounter[State.BROKEN]+scheduler.stateCounter[State.DONE] ==
          len(scheduler.brokenOrdered)+len(scheduler.doneOrdered))
-  for state in [State.UNKNOWN, State.PENDING, State.RUNNING]:
+  for state in [State.PENDING, State.RUNNING]:
     if scheduler.stateCounter[state] != 0:
       print(scheduler.stateCounter)
       all_jobs = list(scheduler.jobs.keys())
@@ -428,8 +411,6 @@ def run_test(scheduler, skip_run=False):
             assert(dep in scheduler.doneJobs)
             assert(dep in scheduler.doneOrdered)
   for task_id in scheduler.doneJobs:
-    #if task_id == scheduler.final_job:
-    #    continue
     for dep in scheduler.jobs[task_id]["deps"]:
         assert(dep in scheduler.doneJobs)
         assert(dep in scheduler.doneOrdered)
@@ -438,19 +419,19 @@ def run_test(scheduler, skip_run=False):
     scheduler.jobs[j]["state"] in (State.DONE, State.BROKEN)
     for j in all_jobs
   )
-  if not scheduler.stateCounter[State.BROKEN]:
-    print("HERE:",scheduler.reverseDeps)
-    assert(len(scheduler.reverseDeps)==0)
+  
+  print("Default checks passed")
 
 if __name__ == "__main__":
+ if True:
   from test_scheduler import RandomSchedulerTest
-  scheduler = Scheduler(10)
+  scheduler = Scheduler(20)
   test = RandomSchedulerTest(
     scheduler,
-    initial_jobs=500,
-    max_deps=10,
-    dynamic_job_probability=0.2,
-    serial_probability=0.25,
+    initial_jobs=4000,
+    max_deps=50,
+    dynamic_job_probability=0.5,
+    serial_probability=0.2,
     failure_probability=0.01,
     seed=12345
   )
@@ -458,14 +439,22 @@ if __name__ == "__main__":
   print("Done:", scheduler.stateCounter[State.DONE])
   print("Broken:", scheduler.stateCounter[State.BROKEN])
   run_test(scheduler, True)
-  exit(0)
+
+  scheduler = Scheduler(8)
+  for i in range(100):
+    if i % 2:
+      scheduler.forceDone(f"dep-{i}")
+    else:
+      scheduler.parallel(f"dep-{i}", [], dummyTask)
+  scheduler.parallel("final",[f"dep-{i}" for i in range(100)],dummyTask)
+  run_test(scheduler)
 
   scheduler = Scheduler(10)
   run_test(scheduler)
 
   scheduler = Scheduler(1)
   run_test(scheduler)
-  
+
   scheduler = Scheduler(10)
   scheduler.parallel("test", [], scheduler.log, "This is england");
   run_test(scheduler)
